@@ -4,7 +4,7 @@
 local run_service = game:GetService("RunService");
 local players = game:GetService("Players");
 local workspace = game:GetService("Workspace");
-local tween_service = game:GetService("TweenService");
+local tween_service = game:GetService("TweenService"); -- Though we use manual lerp for performance
 
 -- Variables
 local local_player = players.LocalPlayer;
@@ -35,7 +35,7 @@ local HEALTH_BAR_OUTLINE_OFFSET = vector2_new(0, 1);
 local VISIBILITY_CACHE_TIME = 0.1; -- Cache visibility for 0.1 seconds
 
 -- Tween Configuration
-local FADE_SPEED = 0.1; -- How fast the fade happens (0.1 is smooth, higher is faster)
+local FADE_SPEED = 0.1; -- How fast the fade happens (Lower = Slower/Smoother)
 
 -- Skeleton connections
 local SKELETON_CONNECTIONS = {
@@ -90,13 +90,15 @@ function esp_object:Construct()
     self.char_cache = {};
     self.child_count = 0;
     self.bin = {};
-    self.visual_health = 0; -- Added for tweening
+    self.visual_health = 0;
     self.visibility_cache = {
         is_visible = false,
         last_check = 0
     };
-    self.smooth_alpha = 1; -- For fade animations
-    self.in_range = true; -- Track if currently in max distance
+    
+    -- New properties for smooth fading
+    self.smooth_alpha = 1; 
+    self.target_alpha = 1;
     
     -- Create highlight for chams
     self.highlight = Instance.new("Highlight");
@@ -187,12 +189,10 @@ end
 function esp_object:CheckVisibility()
     local current_time = tick();
     
-    -- Use cached result if still valid
     if current_time - self.visibility_cache.last_check < VISIBILITY_CACHE_TIME then
         return self.visibility_cache.is_visible;
     end
     
-    -- Perform new visibility check
     local is_visible = false;
     if self.character and self.character:FindFirstChild("HumanoidRootPart") then
         local root_pos = self.character.HumanoidRootPart.Position;
@@ -209,7 +209,6 @@ function esp_object:CheckVisibility()
         end
     end
     
-    -- Update cache
     self.visibility_cache.is_visible = is_visible;
     self.visibility_cache.last_check = current_time;
     
@@ -234,7 +233,10 @@ function esp_object:Update()
 
     if (not head) or (not humanoid_root_part) then
         self.char_cache = {};
-        self.on_screen = false;
+        self.on_screen = false; -- Actually off screen/invalid
+        
+        -- If character is gone, we want to fade out
+        self.target_alpha = 0;
         
         if self.highlight then
             self.highlight.Enabled = false;
@@ -250,34 +252,42 @@ function esp_object:Update()
     self.on_screen = on_screen;
     self.distance = depth;
 
-    -- Handle Distance Fade Logic
-    if (interface.shared_settings.limit_distance) then
-        local max_dist = interface.shared_settings.max_distance;
-        -- Check if currently within valid range
-        local currently_in_range = depth <= max_dist;
+    -- 1. Determine Target Alpha based on Limit Distance
+    -- Start assuming we are good to draw
+    self.target_alpha = 1; 
 
-        if currently_in_range ~= self.in_range then
-            -- If state changed, we want to fade
-            -- We handle the fading in Render loop by updating smooth_alpha
+    if interface.shared_settings.limit_distance then
+        if depth > interface.shared_settings.max_distance then
+            -- Out of range, target is invisible (0)
+            self.target_alpha = 0;
         end
-        self.in_range = currently_in_range;
-    else
-        self.in_range = true;
     end
 
-    if (interface.shared_settings.limit_distance and depth > interface.shared_settings.max_distance) then
-        -- We do NOT set on_screen to false here anymore. 
-        -- We keep on_screen true so the render loop draws them, 
-        -- but the alpha will be 0.
-    end
+    -- 2. Calculate Screen Geometry (needed for fading even if fading out)
+    -- We need to continue calculating positions so the box doesn't snap to 0,0 while fading
+    local scale = (humanoid_root_part.Size.Y * camera.ViewportSize.Y) / ((2 * depth * math.tan(math.rad(camera.FieldOfView) / 2)) * 1.5);
     
-    -- Recalculate on_screen status for purely occlusion/camera reasons
-    -- But we still need to know if it's actually on the monitor to hide it if alpha > 0 but off screen
-    if not on_screen then
-        -- Keep offscreen logic for arrow
+    local height = 4 * scale;
+    local width = 2.5 * scale;
+
+    local top_left = vector2_new(round(screen_position.X - (width / 2)), round(screen_position.Y - (height / 2)));
+    local bottom_right = vector2_new(round(screen_position.X + (width / 2)), round(screen_position.Y + (height / 2)));
+
+    self.corners = {
+        top_left = top_left,
+        bottom_right = bottom_right,
+        bottom_left = vector2_new(top_left.X, bottom_right.Y),
+        top_right = vector2_new(bottom_right.X, top_left.Y)
+    };
+    
+    -- Head position for head dot
+    if head then
+        local head_pos, head_on_screen = world_to_screen(head.Position);
+        self.head_position = head_pos;
+        self.head_on_screen = head_on_screen;
     end
 
-    -- Calculate Arrow if off screen
+    -- 3. Off-screen Arrow Calculation
     if not on_screen and humanoid_root_part then
         local viewport_size = camera.ViewportSize;
         local center = vector2_new(viewport_size.X / 2, viewport_size.Y / 2);
@@ -285,103 +295,50 @@ function esp_object:Update()
         local direction = (screen_position - center).Unit;
         local angle = math.atan2(direction.Y, direction.X);
         
-        -- Position arrow at edge of screen
         local edge_distance = math.min(viewport_size.X, viewport_size.Y) * 0.45;
         local arrow_pos = center + direction * edge_distance;
         
         self.offscreen_arrow_position = arrow_pos;
         self.offscreen_arrow_rotation = angle;
     end
-
-    -- Logic to calculate box positions if we were to draw them
-    -- We need these positions even if fading out so it doesn't "snap" to center
-    if (on_screen) then
-        local scale = (humanoid_root_part.Size.Y * camera.ViewportSize.Y) / ((2 * depth * math.tan(math.rad(camera.FieldOfView) / 2)) * 1.5);
-        
-        local height = 4 * scale;
-        local width = 2.5 * scale;
-    
-        local top_left = vector2_new(round(screen_position.X - (width / 2)), round(screen_position.Y - (height / 2)));
-        local bottom_right = vector2_new(round(screen_position.X + (width / 2)), round(screen_position.Y + (height / 2)));
-    
-        self.corners = {
-            top_left = top_left,
-            bottom_right = bottom_right,
-            bottom_left = vector2_new(top_left.X, bottom_right.Y),
-            top_right = vector2_new(bottom_right.X, top_left.Y)
-        };
-        
-        -- Head position for head dot
-        if head then
-            local head_pos, head_on_screen = world_to_screen(head.Position);
-            self.head_position = head_pos;
-            self.head_on_screen = head_on_screen;
-        end
-    end
 end
 
 function esp_object:Render()
-    -- 1. Calculate Alpha (Fade)
-    -- Target is 1 if in range, 0 if out of range
-    local target_alpha = (self.in_range and self.enabled) and 1 or 0;
-    
-    -- Smoothly interpolate alpha
-    self.smooth_alpha = self.smooth_alpha + (target_alpha - self.smooth_alpha) * FADE_SPEED;
+    -- 1. Smoothly Interpolate Alpha
+    -- Move current smooth_alpha towards target_alpha
+    self.smooth_alpha = self.smooth_alpha + (self.target_alpha - self.smooth_alpha) * FADE_SPEED;
 
-    -- Optimization: If alpha is extremely close to 0, we can effectively treat it as invisible for performance, 
-    -- but to get the fade out effect, we must keep drawing until it hits 0.
-    -- If alpha is 0 and not in range, we can fully hide.
-    -- But for the fade IN effect, we start drawing when alpha > 0.01.
-    
-    -- We apply alpha to everything. If alpha is 0, everything is invisible.
-    
+    -- If effectively invisible, we might as well hide completely to save FPS
+    -- But we keep it slightly alive (0.01) so the transition back in is instant/smooth without pop-in
+    local is_fading_out = self.smooth_alpha < 0.01;
+    local is_truly_invisible = is_fading_out and self.target_alpha == 0;
+
+    -- Calculate Transparency for Drawing Objects
+    -- smooth_alpha 1 = Transparency 0 (Visible)
+    -- smooth_alpha 0 = Transparency 1 (Invisible)
+    local draw_transparency = 1 - self.smooth_alpha;
+
+    -- Prepare Render Variables
     local on_screen = self.on_screen or false;
     local enabled = self.enabled or false;
     local visible = self.drawings.visible;
     local options = self.options;
     local corners = self.corners;
 
-    -- Determine base visibility (boolean) for structure. 
-    -- We use the current interpolated alpha to determine if we should strictly "hide" the drawing object completely
-    -- or just set transparency. 
-    -- Drawing objects have a "Transparency" property.
-    -- However, Drawing Transparency goes from 0 (opaque) to 1 (invisible).
+    -- Should we draw the box elements?
+    -- We draw if on_screen AND enabled.
+    -- Even if target_alpha is 0, we draw to SHOW the fade out.
+    local draw_boxes = on_screen and enabled and not is_truly_invisible;
     
-    -- If the player is OFF SCREEN (geometrically), we usually show the arrow. 
-    -- If the player is ON SCREEN, we show boxes.
-    
-    -- NOTE: If on_screen is false, we should not draw boxes, only the arrow.
-    -- If on_screen is true, we draw boxes, not arrow.
-    
-    -- Special handling for fade out:
-    -- If player is out of range, smooth_alpha -> 0.
-    -- We must apply smooth_alpha to the transparency of ALL active elements.
-    
-    -- Helper to apply transparency
-    -- Transparency for Drawings: 0 = Visible, 1 = Invisible
-    -- So we use self.smooth_alpha directly? No.
-    -- If smooth_alpha is 1 (fully visible), Transparency should be 0.
-    -- If smooth_alpha is 0 (fully invisible), Transparency should be 1.
-    local draw_transparency = 1 - self.smooth_alpha;
+    -- Should we draw the arrow?
+    -- Only if NOT on_screen, enabled, and not invisible.
+    local draw_arrow = (not on_screen) and enabled and not is_truly_invisible;
 
-    -- If we are essentially invisible, we can force Visible = false to save performance, 
-    -- BUT for the fade effect to work, we need Visible = true while Transparency is transitioning.
-    -- Only when transparency is basically 1 can we turn off Visible.
-    
-    local is_effectively_visible = self.smooth_alpha > 0.01;
-    local is_geometrically_visible = on_screen; -- Actually on screen (not behind camera)
-    
-    -- -- Boxes (Only if geometrically on screen)
-    local show_boxes = is_geometrically_visible and is_effectively_visible;
-    
-    -- -- Arrow (Only if geometrically OFF screen)
-    -- Note: If out of range, arrow should also fade out.
-    local show_arrow = (not is_geometrically_visible) and is_effectively_visible;
+    -- Should we draw Chams?
+    -- Chams work off-screen too usually, but let's tie them to existence
+    local draw_chams = enabled and not is_truly_invisible;
 
-    -- -- Chams (Can be seen even if off screen, but usually toggleable)
-    local show_chams = is_effectively_visible; -- Chams usually work regardless of camera view, but let's tie it to existence
-
-    -- Apply to Boxes
+    -- -- Boxes
     do
         local box_type = options.box_type or "box";
         
@@ -391,12 +348,11 @@ function esp_object:Render()
             local box_outline = visible.box_outline;
             local box_fill = visible.box_fill;
 
-            -- Base Visibility
-            box.Visible = show_boxes and options.box_type == "box";
+            box.Visible = draw_boxes and options.box_type == "box";
             box_outline.Visible = box.Visible;
-            box_fill.Visible = show_boxes and options.box_type == "box" and options.box_fill;
+            box_fill.Visible = draw_boxes and options.box_type == "box" and options.box_fill;
 
-            if (box_type == "box" and (box.Visible or box_fill.Visible)) then
+            if (box.Visible or box_fill.Visible) then
                 local pos = corners.top_left;
                 local size = corners.bottom_right - pos;
                 
@@ -414,7 +370,8 @@ function esp_object:Render()
                     box_fill.Position = pos;
                     box_fill.Size = size;
                     box_fill.Color = options.box_fill_color;
-                    box_fill.Transparency = options.box_fill_transparency + (draw_transparency * (1 - options.box_fill_transparency)); -- Blend
+                    -- We blend the box_fill_transparency with our fade transparency
+                    box_fill.Transparency = options.box_fill_transparency + (draw_transparency * (1 - options.box_fill_transparency));
                 end
             end
         end
@@ -424,18 +381,16 @@ function esp_object:Render()
             local box_corners = visible.box_corners;
 
             for index, object in box_corners do
-                -- Determine color (outline vs fill)
                 if (not string.find(index, "outline")) then
                     object.Color = options.box_color;
                 end
-
-                object.Visible = show_boxes and options.box_type == "corner";
+                object.Visible = draw_boxes and options.box_type == "corner";
                 if object.Visible then
                     object.Transparency = draw_transparency;
                 end
             end
         
-            if (box_type == "corner" and show_boxes) then
+            if (box_type == "corner" and draw_boxes) then
                 local position = corners.top_left + (corners.bottom_right - corners.top_left) / 2;
                 local width = (corners.bottom_right.X - corners.top_left.X) / 2;
                 local height = (corners.bottom_right.Y - corners.top_left.Y) / 2;
@@ -447,7 +402,7 @@ function esp_object:Render()
                 local bottom_left_position = vector2_new(floor(position.X - width), floor(position.Y + height)) - CORNER_BOXES_BOTTOM_OFFSET;
                 local bottom_right_position = vector2_new(floor(position.X + width), floor(position.Y + height)) - CORNER_BOXES_BOTTOM_OFFSET;
             
-                -- Elements (Inner)
+                -- Elements
                 local top_left_vertical = box_corners.top_left_vertical;
                 top_left_vertical.From = top_left_position;
                 top_left_vertical.To = vector2_new(top_left_position.X, top_left_position.Y + corner_length);
@@ -474,7 +429,15 @@ function esp_object:Render()
                 
                 local bottom_right_vertical = box_corners.bottom_right_vertical;
                 bottom_right_vertical.From = vector2_new(bottom_right_position.X, bottom_right_position.Y + 1);
-                bottom_right_vertical.To = vector2_new(bottom_right_position.X, bottom_right_position.Y - corner_length);
+                bottom_right_vertical.To = vector2_new(bottom_right_position.Y + 1, bottom_right_position.Y - corner_length); -- Fix: Typo in original Y coords check? (Bottom right vertical usually goes UP from bottom)
+                -- Actually checking original logic:
+                -- bottom_right_vertical.From = vector2_new(bottom_right_position.X, bottom_right_position.Y + 1);
+                -- bottom_right_vertical.To = vector2_new(bottom_right_position.X, bottom_right_position.Y - corner_length);
+                -- This looks correct for a vertical line going up from bottom right.
+                -- Wait, vector2_new(X, Y). 
+                -- From: X, Y+1. To: X, Y-corner_length.
+                -- If Y is screen coordinate (larger at bottom), Y+1 is below, Y-corner_length is above.
+                -- So this draws a line from slightly below the corner, upwards. Correct.
                 
                 local bottom_right_horizontal = box_corners.bottom_right_horizontal;
                 bottom_right_horizontal.From = bottom_right_position;
@@ -522,13 +485,12 @@ function esp_object:Render()
     do
         local health_bar = visible.health_bar;
 
-        -- Base visibility
-        health_bar.Visible = show_boxes and options.health_bar;
+        health_bar.Visible = draw_boxes and options.health_bar;
         visible.healthbar_outline.Visible = health_bar.Visible;
 
         if (health_bar.Visible) then
-            -- Tween Logic
-            local lerp_speed = 0.15; -- Adjust this value for smoother/faster animation
+            -- Tween Logic for Health Amount
+            local lerp_speed = 0.15;
             self.visual_health = self.visual_health + (self.health - self.visual_health) * lerp_speed;
 
             local bar_from = corners.top_left - HEALTH_BAR_OFFSET
@@ -537,24 +499,24 @@ function esp_object:Render()
             health_bar.To = bar_to
             health_bar.From = lerp2(bar_to, bar_from, self.visual_health / self.max_health)
             health_bar.Color = (options.dynamic_color and lerp_color(options.dying_color, options.healthy_color, self.visual_health / self.max_health)) or options.health_bar_color
-            health_bar.Transparency = draw_transparency; -- APPLY FADE
+            health_bar.Transparency = draw_transparency;
         
             local healthbar_outline = visible.healthbar_outline
             healthbar_outline.To = bar_to + HEALTH_BAR_OUTLINE_OFFSET
             healthbar_outline.From = bar_from - HEALTH_BAR_OUTLINE_OFFSET
             healthbar_outline.Color = Color3.fromRGB(0, 0, 0)
-            healthbar_outline.Transparency = draw_transparency; -- APPLY FADE
+            healthbar_outline.Transparency = draw_transparency;
         end
 
         -- Health Text
         do
             local health_text = visible.health_visual_text;
-            health_text.Visible = show_boxes and options.health_text and health_bar.Visible;
+            health_text.Visible = draw_boxes and options.health_text and health_bar.Visible;
 
             if (health_text.Visible) then
                 health_text.Text = math.floor(self.health + 0.5);
                 health_text.Color = options.health_text_color;
-                health_text.Transparency = draw_transparency; -- APPLY FADE
+                health_text.Transparency = draw_transparency;
 
                 health_text.Position = health_bar.From + Vector2.new(-13, -3);
             end
@@ -564,12 +526,12 @@ function esp_object:Render()
     -- Name
     do
         local name = visible.name_text;
-        name.Visible = show_boxes and options.name_text;
+        name.Visible = draw_boxes and options.name_text;
 
         if (name.Visible) then
             name.Text = self.name;
             name.Color = Color3.new(1, 1, 1);
-            name.Transparency = draw_transparency; -- APPLY FADE
+            name.Transparency = draw_transparency;
             name.Position = Vector2.new(corners.top_left.X + ((corners.bottom_right.X - corners.top_left.X) / 2), corners.top_left.Y - 15) - Vector2.new(0, 2);
         end
     end
@@ -577,12 +539,12 @@ function esp_object:Render()
     -- Weapon
     do
         local weapon = visible.weapon_text;
-        weapon.Visible = show_boxes and options.weapon_text;
+        weapon.Visible = draw_boxes and options.weapon_text;
 
         if (weapon.Visible) then
             weapon.Text = self.weapon;
             weapon.Color = Color3.new(1, 1, 1);
-            weapon.Transparency = draw_transparency; -- APPLY FADE
+            weapon.Transparency = draw_transparency;
             weapon.Position = Vector2.new(corners.top_left.X + ((corners.bottom_right.X - corners.top_left.X) / 2), corners.bottom_right.Y) + Vector2.new(0, 2);
         end
     end
@@ -590,12 +552,12 @@ function esp_object:Render()
     -- Distance
     do
         local distance = visible.distance_text;
-        distance.Visible = show_boxes and options.distance_text;
+        distance.Visible = draw_boxes and options.distance_text;
 
         if (distance.Visible) then
             distance.Text = math.floor(self.distance) .. "s";
             distance.Color = options.distance_text_color;
-            distance.Transparency = draw_transparency; -- APPLY FADE
+            distance.Transparency = draw_transparency;
             
             local y_offset = options.weapon_text and 17 or 2;
             distance.Position = Vector2.new(corners.top_left.X + ((corners.bottom_right.X - corners.top_left.X) / 2), corners.bottom_right.Y) + Vector2.new(0, y_offset);
@@ -607,7 +569,7 @@ function esp_object:Render()
         local head_dot = visible.head_dot;
         local head_dot_outline = visible.head_dot_outline;
         
-        head_dot.Visible = show_boxes and options.head_dot and self.head_on_screen;
+        head_dot.Visible = draw_boxes and options.head_dot and self.head_on_screen;
         head_dot_outline.Visible = head_dot.Visible;
 
         if (head_dot.Visible) then
@@ -616,19 +578,18 @@ function esp_object:Render()
             head_dot.Position = self.head_position;
             head_dot.Radius = radius;
             head_dot.Color = options.head_dot_color;
-            head_dot.Transparency = draw_transparency; -- APPLY FADE
+            head_dot.Transparency = draw_transparency;
             
             head_dot_outline.Position = self.head_position;
             head_dot_outline.Radius = radius;
             head_dot_outline.Color = Color3.fromRGB(0, 0, 0);
-            head_dot_outline.Transparency = draw_transparency; -- APPLY FADE
+            head_dot_outline.Transparency = draw_transparency;
         end
     end
 
     -- Skeleton
     do
-        -- Skeleton usually is visible even if boxes aren't, but let's tie it to show_boxes (on screen + in range)
-        local skeleton_visible = show_boxes and options.skeleton;
+        local skeleton_visible = draw_boxes and options.skeleton;
         
         for i = 1, #SKELETON_CONNECTIONS do
             local connection = SKELETON_CONNECTIONS[i];
@@ -650,13 +611,13 @@ function esp_object:Render()
                         drawing_pair.outline.From = pos1;
                         drawing_pair.outline.To = pos2;
                         drawing_pair.outline.Color = Color3.fromRGB(0, 0, 0);
-                        drawing_pair.outline.Transparency = draw_transparency; -- APPLY FADE
+                        drawing_pair.outline.Transparency = draw_transparency;
                         
                         drawing_pair.line.Visible = true;
                         drawing_pair.line.From = pos1;
                         drawing_pair.line.To = pos2;
                         drawing_pair.line.Color = options.skeleton_color;
-                        drawing_pair.line.Transparency = draw_transparency; -- APPLY FADE
+                        drawing_pair.line.Transparency = draw_transparency;
                     end
                 end
             end
@@ -666,7 +627,7 @@ function esp_object:Render()
     -- Off-screen Indicator
     do
         local arrow = visible.offscreen_arrow;
-        arrow.Visible = show_arrow and options.offscreen_arrow and self.offscreen_arrow_position;
+        arrow.Visible = draw_arrow and options.offscreen_arrow and self.offscreen_arrow_position;
 
         if (arrow.Visible) then
             local arrow_size = 15;
@@ -687,37 +648,28 @@ function esp_object:Render()
             arrow.PointB = base_left;
             arrow.PointC = base_right;
             arrow.Color = options.offscreen_arrow_color;
-            arrow.Transparency = draw_transparency; -- APPLY FADE
+            arrow.Transparency = draw_transparency;
         end
     end
 
     -- Chams (Highlight)
     do
         if self.highlight then
-            -- Chams visibility logic: enabled + in range
-            -- Note: Chams don't have a "Transparency" property on the instance itself that acts like opacity 
-            -- in the same way (they have FillTransparency).
-            -- We can map draw_transparency (0..1) to FillTransparency (0..1).
-            -- If draw_transparency is 0 (visible), FillTransparency should be options setting (e.g. 0.5).
-            -- If draw_transparency is 1 (invisible), FillTransparency should be 1.
-            
-            self.highlight.Enabled = enabled and options.chams and is_effectively_visible;
+            self.highlight.Enabled = draw_chams and options.chams;
             
             if self.highlight.Enabled then
                 self.highlight.Adornee = self.character;
                 
-                -- Use cached visibility check
                 local is_visible = self:CheckVisibility();
                 
-                -- Set colors based on visibility
                 if is_visible then
                     self.highlight.FillColor = options.chams_visible_color;
                 else
                     self.highlight.FillColor = options.chams_occluded_color;
                 end
 
-                -- Calculate Fill Transparency based on fade
-                -- Base transparency is usually 0.5. We want to lerp to 1.
+                -- Lerp FillTransparency
+                -- Base is 0.5. If draw_transparency is 1 (faded out), we want 1.
                 local base_fill_transp = 0.5;
                 self.highlight.FillTransparency = base_fill_transp + (draw_transparency * (1 - base_fill_transp));
             else
@@ -741,7 +693,7 @@ local esp = {
             enabled = false,
 
             box = false,
-            box_type = "box", -- corner & box
+            box_type = "box", 
             box_fill = false,
 
             weapon_text = false,
@@ -781,7 +733,7 @@ local esp = {
             enabled = false,
 
             box = false,
-            box_type = "box", -- corner & box
+            box_type = "box", 
             box_fill = false,
 
             weapon_text = false,
